@@ -144,9 +144,18 @@ class RolloutStorage:
                 storage copy and no additional overhead. Typical use: replace a float32
                 RGB image with a uint8 raw image to shrink the rollout buffer.
             obs_decompress_fn: Optional training-time transform ``stored_batch -> model_obs``
-                called once per mini-batch inside :meth:`mini_batch_generator`. Produces the
+                called once per yielded batch from :meth:`mini_batch_generator`,
+                :meth:`recurrent_mini_batch_generator`, and :meth:`generator`. Produces the
                 observation :class:`~tensordict.TensorDict` that the actor/critic consume.
                 Pass-through keys may be returned by reference for zero extra copies.
+
+                The function must be rank-polymorphic over leading batch axes: the feedforward
+                generator passes a single batch axis ``[M, *obs]``, the distillation generator
+                passes ``[N, *obs]``, and the recurrent generator passes
+                ``[T_padded, trajectories, *obs]``. The typical discipline is to address the
+                fixed trailing observation axes by negative index (e.g. ``mean(dim=(-3, -2))``
+                for image H/W and ``movedim(-1, -3)`` for HWC -> CHW), which makes the
+                function work across all three call sites without special-casing.
         """
         self.training_type = training_type
         self.device = device
@@ -243,8 +252,11 @@ class RolloutStorage:
             raise ValueError("This function is only available for distillation training.")
 
         for i in range(self.num_transitions_per_env):
+            obs = self.observations[i]
+            if self._obs_decompress_fn is not None:
+                obs = self._obs_decompress_fn(obs)
             yield RolloutStorage.Batch(
-                observations=self.observations[i],  # type: ignore
+                observations=obs,  # type: ignore
                 privileged_actions=self.privileged_actions[i],
                 dones=self.dones[i],
             )
@@ -345,9 +357,13 @@ class RolloutStorage:
                 else:
                     hidden_state_c_batch = None
 
+                obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
+                if self._obs_decompress_fn is not None:
+                    obs_batch = self._obs_decompress_fn(obs_batch)
+
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
-                    observations=padded_obs_trajectories[:, first_traj:last_traj],  # type: ignore
+                    observations=obs_batch,  # type: ignore
                     actions=self.actions[:, start:stop],
                     values=self.values[:, start:stop],
                     advantages=self.advantages[:, start:stop],
