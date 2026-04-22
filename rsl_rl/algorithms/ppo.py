@@ -433,8 +433,21 @@ class PPO:
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
 
+        # Resolve optional observation compression hooks.
+        obs_compress_fn = resolve_callable(cfg["obs_compress_fn"]) if cfg.get("obs_compress_fn") else None
+        obs_decompress_fn = resolve_callable(cfg["obs_decompress_fn"]) if cfg.get("obs_decompress_fn") else None
+
         # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        storage = RolloutStorage(
+            "rl",
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            obs,
+            [env.num_actions],
+            device,
+            obs_compress_fn=obs_compress_fn,
+            obs_decompress_fn=obs_decompress_fn,
+        )
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])

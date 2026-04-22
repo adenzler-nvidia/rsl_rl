@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import torch
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from tensordict import TensorDict
 
 from rsl_rl.modules import HiddenState
@@ -130,17 +130,43 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        obs_compress_fn: Callable[[TensorDict], TensorDict] | None = None,
+        obs_decompress_fn: Callable[[TensorDict], TensorDict] | None = None,
     ) -> None:
-        """Allocate rollout buffers for a specific training mode and batch shape."""
+        """Allocate rollout buffers for a specific training mode and batch shape.
+
+        Args:
+            obs_compress_fn: Optional collection-time transform ``live_obs -> stored_obs``.
+                Called once per environment step before the transition is stored. May change
+                dtype, shape, or key schema — the returned :class:`~tensordict.TensorDict`
+                defines how the observation buffer is laid out. Keys that are returned as
+                references to ``live_obs`` entries pass through with the usual per-key
+                storage copy and no additional overhead. Typical use: replace a float32
+                RGB image with a uint8 raw image to shrink the rollout buffer.
+            obs_decompress_fn: Optional training-time transform ``stored_batch -> model_obs``
+                called once per mini-batch inside :meth:`mini_batch_generator`. Produces the
+                observation :class:`~tensordict.TensorDict` that the actor/critic consume.
+                Pass-through keys may be returned by reference for zero extra copies.
+        """
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
 
+        # Observation compression/decompression hooks (optional; pass-through if None).
+        self._obs_compress_fn = obs_compress_fn
+        self._obs_decompress_fn = obs_decompress_fn
+
         # Core
+        # If a compression hook is set, the storage schema is defined by its output on a
+        # sample observation. Otherwise storage mirrors the live observation schema.
+        storage_schema = obs_compress_fn(obs) if obs_compress_fn is not None else obs
         self.observations = TensorDict(
-            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
+            {
+                key: torch.zeros(num_transitions_per_env, *value.shape, dtype=value.dtype, device=device)
+                for key, value in storage_schema.items()
+            },
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
@@ -174,7 +200,12 @@ class RolloutStorage:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
         # Core
-        self.observations[self.step].copy_(transition.observations)
+        stored_obs = (
+            self._obs_compress_fn(transition.observations)
+            if self._obs_compress_fn is not None
+            else transition.observations
+        )
+        self.observations[self.step].copy_(stored_obs)
         self.actions[self.step].copy_(transition.actions)  # type: ignore
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -243,9 +274,13 @@ class RolloutStorage:
                 stop = (i + 1) * mini_batch_size
                 batch_idx = indices[start:stop]
 
+                obs_batch = observations[batch_idx]
+                if self._obs_decompress_fn is not None:
+                    obs_batch = self._obs_decompress_fn(obs_batch)
+
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
-                    observations=observations[batch_idx],  # type: ignore
+                    observations=obs_batch,  # type: ignore
                     actions=actions[batch_idx],
                     values=values[batch_idx],
                     advantages=advantages[batch_idx],
